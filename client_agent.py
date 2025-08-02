@@ -5,6 +5,7 @@ import time
 import os
 from dotenv import load_dotenv
 load_dotenv()
+
 AGENT_ENDPOINTS = {
     "data_agent": "http://localhost:8001",
     "summary_agent": "http://localhost:8002",
@@ -19,8 +20,9 @@ def fetch_agent_card(agent):
 
 def dispatch_to_agent(agent, capability, payload):
     card = fetch_agent_card(agent)
+
     if capability not in card["capabilities"]:
-        raise Exception(f"{capability} not supported by {agent}")
+        raise Exception(f"[ERROR] {capability} not supported by {agent}. Available: {card['capabilities']}")
     
     print(f"\n[Client Agent] Calling {agent} with capability: {capability}")
     print(json.dumps(card, indent=2))
@@ -31,25 +33,38 @@ def dispatch_to_agent(agent, capability, payload):
     )
 
     if response.status_code == 200:
-        return response.json()["artifact"]
+        return response.json().get("artifact", "[No result]")
     else:
-        raise Exception(f"{agent} failed: {response.text}")
+        raise Exception(f"[ERROR] {agent} failed: {response.text}")
 
 def llm_decision_engine(user_input):
     print("[LLM] Sending user input to Gemini...")
 
-    GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+    GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     API_KEY = os.getenv("GEMINI_API_KEY")
 
     prompt = f"""
-    You are an AI coordinator. Based on the following user query, decide which agents should handle it.
-    Return a JSON list of steps. Each step should have:
-    - 'agent': one of 'data_agent', 'summary_agent', 'formatter_agent', 'qa_agent'
-    - 'capability': capability name
-    - 'input': the text to process
+You are an AI coordinator. Based on the user query, break the task into steps.
+Use only the following valid capabilities:
 
-    User Query: {user_input}
-    """
+- data_agent: fetch_data
+- summary_agent: summarize
+- formatter_agent: format_report
+- qa_agent: answer_question
+
+Return a pure JSON list of steps (no markdown).
+Example:
+
+[
+  {{
+    "agent": "data_agent",
+    "capability": "fetch_data",
+    "input": "example query"
+  }}
+]
+
+User Query: {user_input}
+"""
 
     headers = { "Content-Type": "application/json" }
     body = {
@@ -60,12 +75,33 @@ def llm_decision_engine(user_input):
     try:
         res = requests.post(f"{GEMINI_API_URL}?key={API_KEY}", headers=headers, json=body)
         content = res.json()
-        reply = content["candidates"][0]["content"]["parts"][0]["text"]
-        print("[LLM] Gemini responded with:\n", reply)
-        return json.loads(reply)
+
+        # Print full response for debug
+        print("[LLM] Full API response:", json.dumps(content, indent=2))
+
+        # Extract raw reply
+        reply_raw = content["candidates"][0]["content"]["parts"][0]["text"]
+        print("[LLM] Gemini responded with:\n", reply_raw)
+
+        # Clean up any markdown formatting
+        reply_clean = reply_raw.strip()
+        if reply_clean.startswith("```json"):
+            reply_clean = reply_clean.removeprefix("```json").removesuffix("```").strip()
+        elif reply_clean.startswith("```"):
+            reply_clean = reply_clean.removeprefix("```").removesuffix("```").strip()
+
+        steps = json.loads(reply_clean)
+        if not isinstance(steps, list):
+            raise ValueError("Expected list of steps.")
+        return steps
+
     except Exception as e:
-        print("[LLM] Gemini failed, falling back:", e)
-        return [{"agent": "qa_agent", "capability": "answer_question", "input": user_input}]
+        print("[LLM] Gemini failed or invalid response. Fallback activated. Reason:", e)
+        return [{
+            "agent": "qa_agent",
+            "capability": "answer_question",
+            "input": user_input
+        }]
 
 def run_a2a_workflow(query):
     print("\n🔍 [Client Agent] Received Query:", query)
@@ -73,8 +109,19 @@ def run_a2a_workflow(query):
     output = None
 
     for step in steps:
+        agent = step.get("agent")
+        capability = step.get("capability")
         payload = step.get("input", output)
-        output = dispatch_to_agent(step["agent"], step["capability"], payload)
+
+        if not agent or not capability:
+            print(f"[WARNING] Skipping invalid step: {step}")
+            continue
+
+        try:
+            output = dispatch_to_agent(agent, capability, payload)
+        except Exception as e:
+            print(f"[ERROR] Agent dispatch failed:", e)
+            break
 
     print("\n✅ Final Output:\n", output)
 
